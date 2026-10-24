@@ -1,4 +1,4 @@
-# Philips OLED909: OSCam with the internal DVB tuner on Android TV 14
+# Philips OLED909 OSCAM with internal DVB-S Philips Tuner
 
 English setup and engineering notes for a TV-specific integration of OSCam with the **original Philips Play TV application and internal tuner**. This repository contains the bridge source, service scripts, pinned OSCam patch, configuration templates and the procedure used on the owner's TV.
 
