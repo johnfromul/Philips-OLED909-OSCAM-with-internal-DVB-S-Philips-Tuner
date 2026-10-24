@@ -1,0 +1,9 @@
+[reader]
+label = home_cccam
+protocol = cccam
+device = reader.example.invalid,12222
+user = READER_USERNAME
+password = READER_PASSWORD
+group = 1
+cccversion = 2.3.2
+ccckeepalive = 1

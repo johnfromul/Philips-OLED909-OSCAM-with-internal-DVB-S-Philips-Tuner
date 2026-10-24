@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ZIG_BIN=${ZIG_EXECUTABLE:-$ROOT/tools/zig/zig}
+if [ ! -x "$ZIG_BIN" ]; then
+    echo 'Set ZIG_EXECUTABLE to Zig 0.15.2, or run tools/bootstrap-zig.sh.' >&2
+    exit 1
+fi
+export ZIG_GLOBAL_CACHE_DIR="$ROOT/.cache/zig-global"
+export ZIG_LOCAL_CACHE_DIR="$ROOT/.cache/zig-local"
+exec "$ZIG_BIN" cc -target aarch64-linux-musl -static "$@"

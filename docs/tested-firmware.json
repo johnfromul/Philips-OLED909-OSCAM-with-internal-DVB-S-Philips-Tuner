@@ -1,0 +1,21 @@
+{
+  "verified_on": "2026-10-24",
+  "model": "65OLED909/12",
+  "product_model": "Philips Google TV TA5",
+  "product_device": "PH1M_WW_9972",
+  "philips_firmware": "TPM231WW_R.201.100.146.220",
+  "firmware_property": "ro.odm.tpvision.product.swver",
+  "android_version": "14",
+  "android_display_id": "UKN2.241117.001",
+  "android_incremental": "3000428",
+  "android_security_patch": "2025-09-05",
+  "system_fingerprint": "Philips/PH1M_WW_9972_20/PH1M_WW_9972:14/UKN2.241117.001/3000428:user/release-keys",
+  "vendor_fingerprint": "Philips/PH1M_WW_9972/PH1M_WW_9972:14/UKN2.241117.001/3000428:user/release-keys",
+  "kernel": "5.15.180-android14-11-00042-g766efc243647-dirty",
+  "root": "Magisk 31.0",
+  "root_context": "u:r:magisk:s0",
+  "selinux": "Enforcing",
+  "oscam_version": "2.26.09-11968@39e78a46",
+  "oscam_commit": "39e78a4688b30abaab62b5c9e13672b4e34bfca0",
+  "deployed_oscam_sha256": "0f54a9508e2500c5158008c81383e0a0972db2ce81a17fdbc8d056c6834a983e"
+}

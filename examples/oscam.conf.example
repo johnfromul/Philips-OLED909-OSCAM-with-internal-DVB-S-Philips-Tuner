@@ -1,0 +1,17 @@
+[global]
+logfile = /data/local/tmp/oscam-mtk/oscam.log
+maxlogsize = 512
+clienttimeout = 5000
+
+[dvbapi]
+enabled = 1
+boxtype = pc-nodmx
+pmt_mode = 4
+user = mtk_bridge
+au = 0
+
+[webif]
+httpport = 8888
+httpuser = admin
+httppwd = CHANGE_ME_WEBIF_PASSWORD
+httpallowed = 127.0.0.1,192.168.1.1-192.168.1.254
