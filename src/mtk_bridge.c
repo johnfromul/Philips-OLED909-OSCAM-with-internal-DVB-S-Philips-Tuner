@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later */
 #define _GNU_SOURCE
 #define __user
 #include <stdbool.h>
@@ -264,8 +263,20 @@ int main(int argc,char **argv) {
                 } else if(op==0x40086f87) {
                     unsigned pid=mtk_be32(input+5);int32_t index=(int32_t)mtk_be32(input+9);
                     int valid=0;for(unsigned a=0;a<allowed_count;a++)if(allowed[a]==pid)valid=1;
-                    if(!valid || (index!=0 && index!=-1) || ca_pid(&ca,pid,index>=0)<0) {
-                        fprintf(stderr,"PID_BIND_FAILED pid=%u errno=%d\n",pid,errno);stopping=1;break;
+                    unsigned bound=0;for(unsigned a=0;a<ca.count;a++)if(ca.pids[a]==pid)bound=1;
+                    const char *reason=NULL;int saved_errno=0;
+                    if(!valid) reason="pid_not_in_pmt";
+                    else if(index!=0 && index!=-1) reason="unsupported_index";
+                    else if(ca.fd>=0 && index>=0 && !bound && ca.count==32) reason="pid_capacity";
+                    else if(ca_pid(&ca,pid,index>=0)<0) {saved_errno=errno;reason=index>=0?"add_pid_ioctl":"remove_pid_ioctl";}
+                    if(reason) {
+                        fprintf(stderr,"PID_BIND_FAILED pid=%u index=%d reason=%s bound=%u active_count=%u allowed_count=%u hardware_applied=%d",pid,index,reason,bound,ca.count,allowed_count,hardware);
+                        if(saved_errno)fprintf(stderr," errno=%d",saved_errno);
+                        fputs(" allowed_pids=",stderr);
+                        for(unsigned a=0;a<allowed_count;a++)fprintf(stderr,"%s%u",a?",":"",allowed[a]);
+                        fputs(" active_pids=",stderr);
+                        for(unsigned a=0;a<ca.count;a++)fprintf(stderr,"%s%u",a?",":"",ca.pids[a]);
+                        fputc('\n',stderr);stopping=1;break;
                     }
                     printf("CW_PID_ASSOCIATION pid=%u index=%d hardware_applied=%d\n",pid,index,hardware);
                 } else if(op==0x40106f86) {
