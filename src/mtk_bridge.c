@@ -26,6 +26,7 @@
  * vendor's source/PID/key interface, validated by the isolated session probe.
  */
 #define FILTERS 64
+#define EXIT_CHANNEL_MISMATCH 21
 struct section_filter { int fd; uint8_t demux, number; uint16_t pid; };
 static volatile sig_atomic_t stopping;
 static int fatal_error;
@@ -170,7 +171,11 @@ int main(int argc,char **argv) {
     int pat=pat_open();
     if(pat<0) {perror("PAT_OPEN");return 1;}
     int discovered=pat_find(pat,(uint16_t)service,(uint16_t)tsid);
-    if(discovered<0 || (pmt && discovered!=(int)pmt)) {puts("PAT_SERVICE_UNAVAILABLE");close(pat);return 1;}
+    if(discovered<0 || (pmt && discovered!=(int)pmt)) {
+        puts("PAT_SERVICE_UNAVAILABLE");
+        close(pat);
+        return stopping ? 1 : EXIT_CHANNEL_MISMATCH;
+    }
     pmt=(unsigned)discovered;
     struct section_filter filters[FILTERS];
     for(int i=0;i<FILTERS;i++) filters[i].fd=-1;
@@ -253,13 +258,19 @@ int main(int argc,char **argv) {
                 else if(op==0x403c6f2b) {
                     unsigned number=input[6];uint16_t pid=mtk_be16(input+7);
                     if(number>=FILTERS || input[4]!=0 || input[5]!=0) {puts("FILTER_OUT_OF_RANGE");stopping=1;break;}
+                    // Readiness in this poll batch belongs to the previous filter,
+                    // even if open() returns the same descriptor number.
+                    pfds[number+1].revents=0;
                     close_filter(&filters[number]);
                     filters[number]=(struct section_filter){.fd=section_open(pid,input+9,input+25,input+41,
                         mtk_be32(input+57),mtk_be32(input+61)),.demux=input[5],.number=number,.pid=pid};
                     if(filters[number].fd<0) {fprintf(stderr,"FILTER_OPEN_FAILED pid=%u errno=%d\n",pid,errno);stopping=1;break;}
                     if(ecms<4)printf("ECM_FILTER_START number=%u pid=%u\n",number,pid);
                 } else if(op==0x00006f2a) {
-                    if(input[6]<FILTERS)close_filter(&filters[input[6]]);
+                    if(input[6]<FILTERS) {
+                        pfds[input[6]+1].revents=0;
+                        close_filter(&filters[input[6]]);
+                    }
                 } else if(op==0x40086f87) {
                     unsigned pid=mtk_be32(input+5);int32_t index=(int32_t)mtk_be32(input+9);
                     int valid=0;for(unsigned a=0;a<allowed_count;a++)if(allowed[a]==pid)valid=1;

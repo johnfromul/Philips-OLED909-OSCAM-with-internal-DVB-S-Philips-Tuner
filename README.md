@@ -4,6 +4,10 @@ English setup and engineering notes for a TV-specific integration of OSCam with 
 
 **Verified on 24 October 2026:** encrypted Prima HD played with picture and sound; automatic channel changes, service startup after a TV reboot, and OSCam 2.26.09-11968 were tested. The owner confirmed picture and sound after the final upgrade. The remaining CAS stability issue is described below and in [troubleshooting](docs/troubleshooting.md).
 
+## Bridge builds
+
+See [bridge versions](docs/bridge-versions.md) for the current build, the previous TV backup, and verification results. The current build moves metadata queries off the supervisor loop, safely replaces DVB filters, and preserves diagnostics offsets across restarts.
+
 ## Tested TV and firmware
 
 | Item | Observed value |

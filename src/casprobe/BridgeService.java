@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later */
 package casprobe;
 
 import android.media.MediaCas;
@@ -11,6 +10,10 @@ import java.nio.channels.FileLock;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.*;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.*;
 
@@ -18,22 +21,40 @@ import java.util.regex.*;
 public final class BridgeService {
     private static final String ROOT = "/data/local/tmp/oscam-mtk";
     private static final String INPUT = "com.mediatek.dtv.tvinput.dvbtuner/.DvbTvInputService/HW0";
+    private static final int METADATA_CACHE_LIMIT = 64;
+    private static final int METADATA_TIMEOUT_SECONDS = 6;
+    private static final long OBSERVATION_GRACE_MS = 1500;
+    private static final long PLAYBACK_RECOVERY_MS = 20000;
+    private static final int EXIT_TUNING_TABLE_CHANGED = 10;
+    private static final int EXIT_FREE_TO_AIR = 20;
+    private static final int EXIT_CHANNEL_MISMATCH = 21;
+    private static final Pattern SERVICE_ID =
+            Pattern.compile("(?:^|[ ,])service_id=([0-9]+)(?:,|$)");
+    private static final Pattern TRANSPORT_ID =
+            Pattern.compile("(?:^|[ ,])transport_stream_id=([0-9]+)(?:,|$)");
     private static volatile Running running;
     private static volatile boolean stopping;
+    private static final Object LOG_LOCK = new Object();
     private static final SimpleDateFormat DATE = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.ROOT);
 
-    private static synchronized void log(String message) {
-        try {
-            File file = new File(ROOT, "bridge.log");
-            if (file.length() >= 512 * 1024) {
-                File previous = new File(ROOT, "bridge.log.1");
-                if (previous.exists() && !previous.delete()) throw new IOException("Cannot rotate previous log");
-                if (!file.renameTo(previous)) throw new IOException("Cannot rotate log");
+    private static void log(String message) {
+        // Waiting for the child output thread must not lock out its log writes.
+        synchronized (LOG_LOCK) {
+            try {
+                File file = new File(ROOT, "bridge.log");
+                if (file.length() >= 512 * 1024) {
+                    File previous = new File(ROOT, "bridge.log.1");
+                    if (previous.exists() && !previous.delete()) throw new IOException("Cannot rotate previous log");
+                    if (!file.renameTo(previous)) throw new IOException("Cannot rotate log");
+                }
+                try (BufferedWriter out = new BufferedWriter(new FileWriter(file, true))) {
+                    out.write(DATE.format(new Date()) + " " + message);
+                    out.newLine();
+                }
+            } catch (IOException error) {
+                System.err.println("BRIDGE_LOG_ERROR " + error.getClass().getSimpleName());
             }
-            try (PrintWriter out = new PrintWriter(new FileOutputStream(file, true))) {
-                out.println(DATE.format(new Date()) + " " + message);
-            }
-        } catch (IOException error) { System.err.println("BRIDGE_LOG_ERROR " + error.getClass().getSimpleName()); }
+        }
     }
     private static Object tvManager() throws Exception {
         IBinder binder = (IBinder) Class.forName("android.os.ServiceManager")
@@ -65,25 +86,70 @@ public final class BridgeService {
         }
         return channel;
     }
-    private static int[] metadata(String channel) throws Exception {
-        Process query = new ProcessBuilder("/system/bin/content", "query", "--uri", channel,
-                "--projection", "service_id:transport_stream_id").redirectErrorStream(true).start();
-        if (!query.waitFor(4, TimeUnit.SECONDS)) {
-            query.destroyForcibly();query.waitFor();throw new IOException("Channel query timed out");
+    private static final class ChannelMetadata {
+        final int service;
+        final int transport;
+
+        ChannelMetadata(int service, int transport) {
+            this.service = service;
+            this.transport = transport;
         }
-        String text = new String(query.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-        Matcher sid = Pattern.compile("(?:^|[ ,])service_id=([0-9]+)(?:,|$)").matcher(text.trim());
-        Matcher ts = Pattern.compile("(?:^|[ ,])transport_stream_id=([0-9]+)(?:,|$)").matcher(text.trim());
-        if (query.exitValue()!=0 || !sid.find() || !ts.find()) throw new IOException("Channel metadata unavailable");
-        int service = Integer.parseInt(sid.group(1)), transport = Integer.parseInt(ts.group(1));
-        if (service<=0 || service>65535 || transport<=0 || transport>65535) throw new IOException("Invalid DVB service");
-        return new int[]{service, transport};
+    }
+
+    private static final class MetadataFailure extends IOException {
+        MetadataFailure(String reason) { super(reason); }
+    }
+
+    private static ChannelMetadata queryMetadata(String channel) throws IOException, InterruptedException {
+        File capture = File.createTempFile("channel-query-", ".tmp", new File(ROOT));
+        Process query = null;
+        try {
+            try {
+                // A regular file lets the subprocess complete without waiting for a pipe reader.
+                query = new ProcessBuilder("/system/bin/content", "query", "--uri", channel,
+                        "--projection", "service_id:transport_stream_id")
+                        .redirectErrorStream(true).redirectOutput(capture).start();
+            } catch (IOException error) {
+                throw new MetadataFailure("query_start_failed");
+            }
+            if (!query.waitFor(METADATA_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                throw new MetadataFailure("query_timeout");
+            }
+            if (query.exitValue() != 0) {
+                throw new MetadataFailure("query_exit_" + query.exitValue());
+            }
+            String row;
+            try (InputStream output = new FileInputStream(capture)) {
+                byte[] bytes = output.readNBytes(4097);
+                if (bytes.length > 4096) throw new MetadataFailure("oversized_metadata_output");
+                row = new String(bytes, StandardCharsets.UTF_8).trim();
+            }
+            Matcher sid = SERVICE_ID.matcher(row);
+            Matcher ts = TRANSPORT_ID.matcher(row);
+            if (!sid.find() || !ts.find()) throw new MetadataFailure("metadata_unavailable");
+            int service;
+            int transport;
+            try {
+                service = Integer.parseInt(sid.group(1));
+                transport = Integer.parseInt(ts.group(1));
+            } catch (NumberFormatException error) {
+                throw new MetadataFailure("invalid_dvb_identifiers");
+            }
+            if (service <= 0 || service > 65535 || transport <= 0 || transport > 65535) {
+                throw new MetadataFailure("invalid_dvb_identifiers");
+            }
+            return new ChannelMetadata(service, transport);
+        } finally {
+            if (query != null && query.isAlive()) query.destroyForcibly();
+            if (!capture.delete()) log("METADATA_CAPTURE_CLEANUP_FAILED");
+        }
     }
     private static final class Running implements AutoCloseable {
         final MediaCas cas;
         final MediaCas.Session session;
         final Process child;
         final Thread output;
+        volatile long bridgeReadyAt;
         private boolean closed;
         Running(int sid, int tsid) throws Exception {
             cas = new MediaCas(6210);
@@ -108,7 +174,13 @@ public final class BridgeService {
             }
             output = new Thread(() -> {
                 try (BufferedReader reader = new BufferedReader(new InputStreamReader(child.getInputStream(), StandardCharsets.UTF_8))) {
-                    String line;while((line=reader.readLine())!=null)log(line);
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        if (bridgeReadyAt == 0 && line.startsWith("CW_RECEIVED ")) {
+                            bridgeReadyAt = SystemClock.elapsedRealtime();
+                        }
+                        log(line);
+                    }
                 } catch (IOException error) { log("CHILD_LOG_CLOSED"); }
             }, "bridge-output");
             output.start();
@@ -129,7 +201,13 @@ public final class BridgeService {
     }
     private static synchronized void stopChild() {
         Running previous=running;running=null;
-        if(previous!=null)previous.close();
+        if (previous != null) {
+            try {
+                previous.close();
+            } catch (RuntimeException error) {
+                log("CHILD_CLEANUP_FAILED error=" + error.getClass().getSimpleName());
+            }
+        }
     }
     private static synchronized void startChild(int service,int transport) throws Exception {
         if(!stopping)running=new Running(service,transport);
@@ -141,37 +219,129 @@ public final class BridgeService {
             if(lock==null) {System.err.println("SUPERVISOR_ALREADY_RUNNING");System.exit(73);return;}
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {stopping=true;stopChild();}));
             try (PrintWriter pid = new PrintWriter(ROOT+"/supervisor.pid")) {pid.println(android.os.Process.myPid());}
-            log("SUPERVISOR_START");
-            String selected=null;long retryAt=0;int failures=0;boolean queryFailed=false;
+            log("SUPERVISOR_START metadata_cache=1 async_metadata=1");
+            Map<String, ChannelMetadata> channelMetadata = new LinkedHashMap<>(16, 0.75f, true);
+            ExecutorService metadataWorker = Executors.newSingleThreadExecutor();
+            Future<ChannelMetadata> lookup = null;
+            long lookupStartedAt = 0;
+            long failedObservationAt = -1;
+            String selected = null;
+            long retryAt = 0;
+            int failures = 0;
+            int metadataFailures = 0;
+            try {
             while(!stopping) {
+                String channel;
                 try {
-                    String channel=currentChannel();queryFailed=false;
+                    channel = currentChannel();
+                    failedObservationAt = -1;
+                } catch (Exception error) {
+                    long now = SystemClock.elapsedRealtime();
+                    if (failedObservationAt < 0) {
+                        failedObservationAt = now;
+                        log("CHANNEL_OBSERVATION_FAILED error=" + error.getClass().getSimpleName());
+                    }
+                    if (now - failedObservationAt >= OBSERVATION_GRACE_MS) {
+                        if (lookup != null) {
+                            lookup.cancel(true);
+                            lookup = null;
+                        }
+                        if (running != null) {
+                            log("CHANNEL_OBSERVATION_EXPIRED");
+                            stopChild();
+                        }
+                    }
+                    SystemClock.sleep(400);
+                    continue;
+                }
+                String phase = "channel_change";
+                try {
                     if(!Objects.equals(selected,channel)) {
+                        if (lookup != null) {
+                            lookup.cancel(true);
+                            lookup = null;
+                        }
                         stopChild();selected=channel;retryAt=SystemClock.elapsedRealtime()+500;failures=0;
+                        metadataFailures = 0;
                         log("CHANNEL "+(channel==null?"idle":channel));
                     }
-                    if(running!=null && !running.child.isAlive()) {
-                        int status=running.child.exitValue();stopChild();
-                        failures++;retryAt=SystemClock.elapsedRealtime()+(status==20?60000:Math.min(10000,failures*2000));
+                    Running active = running;
+                    if (active != null && active.bridgeReadyAt > 0
+                            && SystemClock.elapsedRealtime() - active.bridgeReadyAt >= PLAYBACK_RECOVERY_MS) {
+                        failures = 0;
+                    }
+                    if(active!=null && !active.child.isAlive()) {
+                        phase = "cleanup_child";
+                        int status=active.child.exitValue();stopChild();
+                        if (status == EXIT_TUNING_TABLE_CHANGED || status == EXIT_CHANNEL_MISMATCH) {
+                            channelMetadata.remove(selected);
+                        }
+                        long delay = status == EXIT_FREE_TO_AIR ? 60000 : 2000L * Math.min(++failures, 5);
+                        retryAt = SystemClock.elapsedRealtime() + delay;
                         log("CHILD_EXIT status="+status);
                     }
                     if(selected!=null && running==null && SystemClock.elapsedRealtime()>=retryAt) {
-                        int[] info=metadata(selected);
-                        // Query again after the external metadata call: never start a stale channel.
+                        phase = "metadata_query";
+                        ChannelMetadata info = channelMetadata.get(selected);
+                        boolean cacheHit = info != null;
+                        if (!cacheHit) {
+                            if (lookup == null) {
+                                String requested = selected;
+                                lookupStartedAt = SystemClock.elapsedRealtime();
+                                lookup = metadataWorker.submit(() -> queryMetadata(requested));
+                            }
+                            if (!lookup.isDone()) {
+                                SystemClock.sleep(400);
+                                continue;
+                            }
+                            try {
+                                info = lookup.get();
+                            } catch (ExecutionException error) {
+                                long now = SystemClock.elapsedRealtime();
+                                metadataFailures = Math.min(metadataFailures + 1, 6);
+                                long delay = 800L * metadataFailures;
+                                retryAt = now + delay;
+                                Throwable cause = error.getCause();
+                                String reason = cause instanceof MetadataFailure ? cause.getMessage() : "query_io_error";
+                                log("RETRY phase=metadata_query reason=" + reason + " elapsed_ms=" +
+                                        (now - lookupStartedAt) + " retry_ms=" + delay + " channel=" + selected);
+                                SystemClock.sleep(400);
+                                continue;
+                            } finally {
+                                lookup = null;
+                            }
+                            channelMetadata.put(selected, info);
+                            if (channelMetadata.size() > METADATA_CACHE_LIMIT) {
+                                channelMetadata.remove(channelMetadata.keySet().iterator().next());
+                            }
+                        }
+                        metadataFailures = 0;
+                        long elapsed = cacheHit ? 0 : SystemClock.elapsedRealtime() - lookupStartedAt;
+                        log("CHANNEL_METADATA source=" + (cacheHit ? "cache" : "provider") +
+                                " elapsed_ms=" + elapsed + " channel=" + selected);
+                        // Recheck the selection after provider I/O even on a cached lookup.
+                        phase = "confirm_channel";
                         if(Objects.equals(selected,currentChannel())) {
-                            log("START service="+info[0]+" tsid="+info[1]);
-                            startChild(info[0],info[1]);
+                            phase = "start_bridge";
+                            log("START service="+info.service+" tsid="+info.transport);
+                            startChild(info.service,info.transport);
                         }
                     }
+                } catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                    break;
                 } catch(Exception error) {
-                    stopChild();
-                    if(!queryFailed)log("RETRY "+error.getClass().getSimpleName());
-                    queryFailed=true;retryAt=SystemClock.elapsedRealtime()+3000;
-                    SystemClock.sleep(1000);
+                    log("RETRY phase="+phase+" error="+error.getClass().getSimpleName());
+                    retryAt=SystemClock.elapsedRealtime()+3000;
                 }
                 SystemClock.sleep(400);
             }
-            stopChild();lock.release();
+            } finally {
+                if (lookup != null) lookup.cancel(true);
+                metadataWorker.shutdownNow();
+                stopChild();
+                lock.release();
+            }
         }
     }
 }
